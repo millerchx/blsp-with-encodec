@@ -5,13 +5,14 @@ import torch
 from torch import nn
 from torch.nn import CrossEntropyLoss
 
-from transformers import PreTrainedModel, LlamaForCausalLM
+from transformers import PreTrainedModel, LlamaForCausalLM, EncodecModel
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers import LlamaConfig, WhisperConfig
+from modeling_encodec_encoder_quantizer import EncodecEncoderQuantizer
 
 try:
-    from .configuration_blsp import BlspConfig
-    from .modeling_whisper_encoder import WhisperEncoder
+    from configuration_blsp import BlspConfig
+    from modeling_whisper_encoder import WhisperEncoder
 except:
     from configuration_blsp import BlspConfig
     from modeling_whisper_encoder import WhisperEncoder
@@ -22,6 +23,7 @@ def lengths_to_padding_mask(lens):
     mask = torch.arange(max_lens).to(lens.device).view(1, max_lens)
     mask = mask.expand(bsz, -1) >= lens.view(bsz, 1).expand(-1, max_lens)
     return mask
+
 
 class Conv1dSubsampler(nn.Module):
     """Convolutional subsampler: a stack of 1D convolution (along temporal
@@ -35,11 +37,11 @@ class Conv1dSubsampler(nn.Module):
     """
 
     def __init__(
-        self,
-        in_channels: int,
-        mid_channels: int,
-        out_channels: int,
-        kernel_sizes: List[int] = (3, 3),
+            self,
+            in_channels: int,
+            mid_channels: int,
+            out_channels: int,
+            kernel_sizes: List[int] = (3, 3),
     ):
         super(Conv1dSubsampler, self).__init__()
         self.n_layers = len(kernel_sizes)
@@ -73,9 +75,9 @@ class Conv1dSubsampler(nn.Module):
 
 class Adapter(nn.Module):
     def __init__(
-        self,
-        in_dim: int,
-        mid_dim: int,
+            self,
+            in_dim: int,
+            mid_dim: int,
     ):
         super(Adapter, self).__init__()
 
@@ -114,33 +116,34 @@ class BlspModel(PreTrainedModel):
         )
         self.speech_ln = torch.nn.LayerNorm(out_d, 1e-5, True)
         self.adapter = Adapter(out_d, config.adapter_inner_dim)
-    
+
     def forward(
-        self,
-        input_ids: torch.LongTensor = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List[torch.FloatTensor]] = None,
-        inputs_embeds: Optional[torch.FloatTensor] = None,
-        labels: Optional[torch.LongTensor] = None,
-        use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-        speech_values: Optional[torch.FloatTensor] = None,
-        speech_attention_mask: Optional[torch.LongTensor] = None,
-        suffix_input_ids: Optional[torch.LongTensor] = None,
-        suffix_attention_mask: Optional[torch.LongTensor] = None,
-        suffix_labels: Optional[torch.LongTensor] = None,
+            self,
+            input_ids: torch.LongTensor = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.LongTensor] = None,
+            past_key_values: Optional[List[torch.FloatTensor]] = None,
+            inputs_embeds: Optional[torch.FloatTensor] = None,
+            labels: Optional[torch.LongTensor] = None,
+            use_cache: Optional[bool] = None,
+            output_attentions: Optional[bool] = None,
+            output_hidden_states: Optional[bool] = None,
+            return_dict: Optional[bool] = None,
+            speech_values: Optional[torch.FloatTensor] = None,
+            speech_attention_mask: Optional[torch.LongTensor] = None,
+            suffix_input_ids: Optional[torch.LongTensor] = None,
+            suffix_attention_mask: Optional[torch.LongTensor] = None,
+            suffix_labels: Optional[torch.LongTensor] = None,
     ):
         ### 1. forward speech
         speech_embeds, speech_attention_mask = self.get_speech_features(speech_values, speech_attention_mask)
-        speech_labels = torch.LongTensor(speech_embeds.size(0), speech_embeds.size(1)).fill_(-100).to(speech_embeds.device)
+        speech_labels = torch.LongTensor(speech_embeds.size(0), speech_embeds.size(1)).fill_(-100).to(
+            speech_embeds.device)
 
         ### 2. forward llama
         prefix_embeds = self.llama_model.get_input_embeddings()(input_ids)
         suffix_embeds = self.llama_model.get_input_embeddings()(suffix_input_ids)
-        
+
         inputs_embeds = torch.cat([prefix_embeds, speech_embeds, suffix_embeds], dim=1)
         attention_mask = torch.cat([attention_mask, speech_attention_mask, suffix_attention_mask], dim=1)
         labels = torch.cat([labels, speech_labels, suffix_labels], dim=1)
@@ -152,18 +155,17 @@ class BlspModel(PreTrainedModel):
             labels=labels,
         )
 
-
     def get_speech_features(self, speech_values, speech_attention_mask):
         w2v_args = {
             "input_features": speech_values,
             "attention_mask": speech_attention_mask,
         }
         output = self.whisper_model(**w2v_args)
-        speech_embeds = output.last_hidden_state # B x T x C
+        speech_embeds = output.last_hidden_state  # B x T x C
         speech_lengths = output.output_lengths
 
         speech_embeds, speech_lengths = self.subsampler(speech_embeds, speech_lengths)
-        speech_embeds = speech_embeds.transpose(0,1) # T x B x C -> B x T x C
+        speech_embeds = speech_embeds.transpose(0, 1)  # T x B x C -> B x T x C
         speech_padding_mask = lengths_to_padding_mask(speech_lengths)
         speech_atts = ~speech_padding_mask
 
@@ -174,17 +176,18 @@ class BlspModel(PreTrainedModel):
 
     @torch.no_grad()
     def generate(
-        self,
-        input_ids,
-        suffix_input_ids,
-        speech_values=None,
-        speech_attention_mask=None,
-        generation_config=None
+            self,
+            input_ids,
+            suffix_input_ids,
+            speech_values=None,
+            speech_attention_mask=None,
+            generation_config=None
     ):
         inputs_embeds, attention_mask = [], []
 
         prefix_embeds = self.llama_model.get_input_embeddings()(input_ids)
-        prefix_attns = torch.ones(prefix_embeds.size(0), prefix_embeds.size(1), dtype=torch.long).to(prefix_embeds.device)
+        prefix_attns = torch.ones(prefix_embeds.size(0), prefix_embeds.size(1), dtype=torch.long).to(
+            prefix_embeds.device)
         inputs_embeds.append(prefix_embeds)
         attention_mask.append(prefix_attns)
 
@@ -194,7 +197,8 @@ class BlspModel(PreTrainedModel):
             attention_mask.append(speech_attention_mask)
 
         suffix_embeds = self.llama_model.get_input_embeddings()(suffix_input_ids)
-        suffix_attns = torch.ones(suffix_embeds.size(0), suffix_embeds.size(1), dtype=torch.long).to(suffix_embeds.device)
+        suffix_attns = torch.ones(suffix_embeds.size(0), suffix_embeds.size(1), dtype=torch.long).to(
+            suffix_embeds.device)
         inputs_embeds.append(suffix_embeds)
         attention_mask.append(suffix_attns)
 
@@ -206,12 +210,12 @@ class BlspModel(PreTrainedModel):
             attention_mask=attention_mask,
             generation_config=generation_config
         )
-    
+
     @torch.no_grad()
     def chat(
-        self,
-        history,
-        generation_config=None
+            self,
+            history,
+            generation_config=None
     ):
         inputs_embeds = []
 
@@ -228,10 +232,34 @@ class BlspModel(PreTrainedModel):
                 inputs_embeds.append(speech_embeds)
             else:
                 raise NotImplementedError
-        
+
         inputs_embeds = torch.cat(inputs_embeds, dim=1)
 
         return self.llama_model.generate(
             inputs_embeds=inputs_embeds,
             generation_config=generation_config
         )
+
+
+class BlspWithEncodecModel(BlspModel):
+    def __init__(self, config: BlspConfig):
+        super().__init__(config)
+        self.encodec_model = EncodecEncoderQuantizer.from_pretrained("facebook/encodec_24khz")
+
+    def get_speech_features(self, speech_values, speech_attention_mask):
+        features = {
+            "input_values": speech_values,
+            "padding_mask": speech_attention_mask,
+        }
+        speech_embeds = self.encodec_model.encode_quantize(**features)
+        speech_lengths = speech_embeds.size(1)
+
+        speech_embeds, speech_lengths = self.subsampler(speech_embeds, speech_lengths)
+        speech_embeds = speech_embeds.transpose(0, 1)  # T x B x C -> B x T x C
+        speech_padding_mask = lengths_to_padding_mask(speech_lengths)
+        speech_atts = ~speech_padding_mask
+
+        speech_embeds = self.adapter(speech_embeds)
+        speech_embeds = self.speech_ln(speech_embeds)
+
+        return speech_embeds, speech_atts
